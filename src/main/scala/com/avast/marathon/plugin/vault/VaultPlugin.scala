@@ -5,12 +5,13 @@ import java.io.File
 import com.bettercloud.vault.{SslConfig, Vault, VaultConfig}
 import mesosphere.marathon.plugin.plugin.PluginConfiguration
 import mesosphere.marathon.plugin.task.RunSpecTaskProcessor
-import mesosphere.marathon.plugin.{ApplicationSpec, EnvVarSecretRef, PodSpec, Secret}
+import mesosphere.marathon.plugin.{ApplicationSpec, PodSpec, RunSpec, Secret}
 import org.apache.mesos.Protos.Environment.Variable
 import org.apache.mesos.Protos.ExecutorInfo.Builder
 import org.apache.mesos.Protos.{TaskGroupInfo, TaskInfo}
 import org.slf4j.LoggerFactory
 import play.api.libs.json.{JsObject, _}
+import scala.collection.JavaConversions._
 
 import scala.util.{Failure, Success, Try}
 
@@ -49,19 +50,24 @@ class VaultPlugin extends RunSpecTaskProcessor with PluginConfiguration {
   }
 
   def taskInfo(appSpec: ApplicationSpec, builder: TaskInfo.Builder): Unit = {
+    apply(appSpec, builder)
+  }
+
+  def taskGroup(podSpec: PodSpec, executor: Builder, taskGroup: TaskGroupInfo.Builder): Unit = {
+    taskGroup.getTasksList.foreach { task =>
+      apply(podSpec, task.toBuilder)
+    }
+  }
+
+  private def apply(runSpec: RunSpec, builder: TaskInfo.Builder): Unit = {
     val envBuilder = builder.getCommand.getEnvironment.toBuilder
-    appSpec.env.foreach {
-      case (name, v: EnvVarSecretRef) =>
-        appSpec.secrets.get(v.secret) match {
-          case Some(secret) =>
-            val pathProvider = selectPathProvider(secret.source).getPath(appSpec, builder)
-            getSecretValueFromVault(secret)(pathProvider) match {
-              case Success(secretValue) => envBuilder.addVariables(Variable.newBuilder().setName(name).setValue(secretValue))
-              case Failure(e) => logger.error(s"Secret ${v.secret} in ${appSpec.id} application cannot be read from Vault (source: ${secret.source})", e)
-            }
-          case None => logger.error(s"Secret ${v.secret} for ${appSpec.id} application not found in secrets definition in Marathon")
+    runSpec.secrets.foreach {
+      case(name, secret) =>
+        val pathProvider = selectPathProvider(secret.source).getPath(runSpec, builder)
+        getSecretValueFromVault(secret)(pathProvider) match {
+          case Success(secretValue) => envBuilder.addVariables(Variable.newBuilder().setName(name).setValue(secretValue))
+          case Failure(e) => logger.error(s"Secret ${name} in ${runSpec.id} application cannot be read from Vault (source: ${secret.source})", e)
         }
-      case _ => // plain environment variable
     }
 
     val commandBuilder = builder.getCommand.toBuilder
@@ -89,22 +95,18 @@ class VaultPlugin extends RunSpecTaskProcessor with PluginConfiguration {
       Failure(new RuntimeException(s"Secret $source cannot be read because it cannot be parsed"))
     }
   }.flatten
-
-  def taskGroup(podSpec: PodSpec, executor: Builder, taskGroup: TaskGroupInfo.Builder): Unit = {
-
-  }
 }
 
 trait VaultPathProvider {
-  def getPath(appSpec: ApplicationSpec, builder: TaskInfo.Builder): String => String
+  def getPath(runSpec: RunSpec, builder: TaskInfo.Builder): String => String
 }
 
 class SharedPathProvider(root: String) extends VaultPathProvider {
-  override def getPath(appSpec: ApplicationSpec, builder: TaskInfo.Builder): String => String =
+  override def getPath(runSpec: RunSpec, builder: TaskInfo.Builder): String => String =
     path => s"$root${if (root.endsWith("/")) "" else "/"}${path.substring(1)}"
 }
 
 class PrivatePathProvider(root: String) extends VaultPathProvider {
-  override def getPath(appSpec: ApplicationSpec, builder: TaskInfo.Builder): String => String =
-    path => s"$root${if (root.endsWith("/")) "" else "/"}${appSpec.id.path.mkString("/")}/$path"
+  override def getPath(runSpec: RunSpec, builder: TaskInfo.Builder): String => String =
+    path => s"$root${if (root.endsWith("/")) "" else "/"}${runSpec.id.path.mkString("/")}/$path"
 }
